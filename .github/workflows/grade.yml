@@ -1,113 +1,114 @@
-name: Autograde - Lab 2-2 (Simple Social Media Page)
+name: Lab 1 Autograder
 
 on:
   push:
+  pull_request:
   workflow_dispatch:
-
-permissions:
-  contents: read
-  issues: write
-
-env:
-  # === Assignment deadline in UTC ===
-  # Example: Local 2025-09-04 20:59 AST (UTC+3) -> 2025-09-04T17:59:00Z
-  DEADLINE_UTC: "2025-09-04T17:59:00Z"
-
-  # HTML file students should submit
-  HTML_FILE: "index.html"
 
 jobs:
   grade:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Compute submission-time status
-        id: submission_time
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Deadline (UTC):  ${DEADLINE_UTC}"
-          latest_ts="$(git log -1 --format=%cI)"
-          echo "Latest commit:   ${latest_ts}"
-
-          dl_epoch=$(date -u -d "${DEADLINE_UTC}" +%s)
-          sub_epoch=$(date -u -d "${latest_ts}" +%s)
-
-          if [ "${sub_epoch}" -le "${dl_epoch}" ]; then
-            status="on-time"
-            echo "On-time submission"
-          else
-            status="late"
-            echo "Late submission (half credit in script)"
-          fi
-
-          # Always pass 25; script will cap to 12.5 when late.
-          echo "points=25" >> "$GITHUB_OUTPUT"
-          echo "status=${status}" >> "$GITHUB_OUTPUT"
-
-      - name: Setup Node
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
-      - name: Install deps (use ci if lockfile exists)
+      - name: Run autograder
+        run: node grade.cjs
+
+      # ✅ Builds artifacts/grade.json for the collection script
+      # Fixes your CSV header: student,score,max_score
+      - name: Build grade.json (obtained/total) for CSV collection
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -f package-lock.json ]]; then
-            echo "package-lock.json found → using npm ci"
-            npm ci
-          else
-            echo "No lockfile → using npm install"
-            npm install --no-audit --no-fund
+
+          if [[ ! -f artifacts/grade.csv ]]; then
+            echo "ERROR: artifacts/grade.csv not found. Make sure grade.cjs writes it."
+            ls -la artifacts || true
+            exit 1
           fi
 
-      - name: Run autograder
-        run: npm run grade
-        env:
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          HTML_FILE: ${{ env.HTML_FILE }}
-          SUBMISSION_POINTS: ${{ steps.submission_time.outputs.points }}
-          SUBMISSION_STATUS: ${{ steps.submission_time.outputs.status }}
+          python3 - <<'PY'
+          import csv, json, os, sys
 
-      - name: Upload artifacts (CSV/JSON/MD)
+          path = "artifacts/grade.csv"
+          with open(path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+              print("ERROR: grade.csv missing header row", file=sys.stderr)
+              sys.exit(1)
+
+            fields_lower = [h.strip().lower() for h in reader.fieldnames]
+
+            def find_col(candidates):
+              for c in candidates:
+                if c in fields_lower:
+                  return reader.fieldnames[fields_lower.index(c)]
+              return None
+
+            # ✅ Your file uses: score, max_score
+            obtained_col = find_col(["score", "obtained", "earned", "points"])
+            total_col    = find_col(["max_score", "total", "possible", "max_points", "max", "out_of"])
+
+            if not obtained_col or not total_col:
+              print("ERROR: Could not find score/max_score columns in grade.csv header.", file=sys.stderr)
+              print("Header:", reader.fieldnames, file=sys.stderr)
+              sys.exit(2)
+
+            obtained = 0.0
+            total = 0.0
+
+            def to_num(x):
+              x = (x or "").strip()
+              if x == "":
+                return 0.0
+              # supports values like "8/10" if that ever happens
+              if "/" in x:
+                a, b = x.split("/", 1)
+                try:
+                  return float(a.strip()), float(b.strip())
+                except:
+                  return 0.0, 0.0
+              try:
+                return float(x)
+              except:
+                return 0.0
+
+            for row in reader:
+              o = row.get(obtained_col, "")
+              t = row.get(total_col, "")
+
+              if isinstance(o, str) and "/" in o and (t is None or str(t).strip() == ""):
+                a, b = to_num(o)
+                obtained += a
+                total += b
+              else:
+                obtained += float(to_num(o))
+                total += float(to_num(t))
+
+            def norm(n):
+              return int(n) if abs(n - int(n)) < 1e-9 else n
+
+            out = {"obtained": norm(obtained), "total": norm(total)}
+            os.makedirs("artifacts", exist_ok=True)
+            with open("artifacts/grade.json", "w", encoding="utf-8") as g:
+              json.dump(out, g)
+            print("Wrote artifacts/grade.json:", out)
+          PY
+
+      # ✅ KEEP YOUR EXISTING "DISPLAY SUMMARY" STEP HERE AS-IS
+
+      - name: Upload grading artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: grading-artifacts
+          name: lab1-grading-feedback
           path: |
-            GRADE.md
-            grade_report.json
-            grade_report.csv
-
-      - name: Create or update grading issue
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const title = 'Automated Grade: Lab 2-2 — Simple Social Media Page';
-            const body = fs.readFileSync('GRADE.md', 'utf8');
-            const { data: issues } = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'open'
-            });
-            const existing = issues.find(i => i.title === title);
-            if (existing) {
-              await github.rest.issues.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: existing.number,
-                body
-              });
-            } else {
-              await github.rest.issues.create({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                title,
-                body,
-                labels: ['grading','autograde']
-              });
-            }
+            artifacts/grade.csv
+            artifacts/grade.json
+            artifacts/feedback/README.md
